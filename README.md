@@ -85,3 +85,5 @@ Usage: get_update_details <GUID>
 ```
 Usage: get_update_link <GUID>
 ```
+
+Thanks to [Marco-online](https://github.com/Marco-online) and his [MSCatalogLTS](https://github.com/Marco-online/MSCatalogLTS) for some impressions.
