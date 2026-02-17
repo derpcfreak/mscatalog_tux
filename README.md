@@ -1,8 +1,6 @@
 # mscatalog_tux.bash
 
-This script is designed to download Windows Drivers for the current hardware from Microsoft® Update Catalog on Linux. It uses the functions from `functions.include` to do so.
-It is a reference script that uses the functions from `functions.include. Feel free to check the functions and create your own script if you want to download other drivers.
-I use this script to download boot-critical drivers during my PXE install of Windows using [P.E.T.E.R.](https://github.com/derpcfreak/P.E.T.E.R.)
+This script is designed to download Windows Drivers for the current hardware from Microsoft® Update Catalog on Linux. It is a reference script that uses the functions from `functions.include. Feel free to check the functions and create your own script if you want to download other drivers. I use this script to download boot-critical drivers during my PXE install of Windows using [P.E.T.E.R.](https://github.com/derpcfreak/P.E.T.E.R.)
 
 If you want to use it for your own purpose just use `mscatalog_tux.bash` as a base for your custom script. Also take a look at the
 functions from `functions.include` for more things you can do.
