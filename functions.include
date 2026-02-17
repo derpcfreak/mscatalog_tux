@@ -1,0 +1,431 @@
+#!/bin/bash
+
+
+######################################################################
+## FUNCTION get_pci_by_class #########################################
+######################################################################
+function get_pci_by_class() {
+    local main="${1:-}"
+    local sub_filter="${2:-}"
+    local include_parents="${3:-0}"         # 1=include parent bridges/hosts
+    local children="${4:-0}"                # NEW: usb|tbt|all|0
+
+    if [[ -z "$main" ]]; then
+        cat <<'HELP'
+Usage:
+  get_pci_by_class <main-class-hex|usb|tbt> [<subclass-hex|'*'|empty>] [<parents>] [<children>]
+
+Arguments:
+  <main-class-hex|usb|tbt> : Main PCI class (2 hex) or convenience values:
+                             'usb' => 0c 03 (USB controllers)
+                             'tbt'/'thunderbolt' => 0c 08 (Thunderbolt controllers)
+  <subclass-hex>           : Subclass filter ('*', empty, or 2 hex digits)
+  <parents>                : "1" to include parent bridges/hosts (default: 0)
+  <children>               : "usb" to list attached USB devices,
+                             "tbt" to list attached Thunderbolt devices,
+                             "all" for both, or "0"/empty for none.
+
+Examples:
+  get_pci_by_class 01                          # All storage controllers
+  get_pci_by_class 01 08                       # NVMe controllers
+  get_pci_by_class 02 00                       # Ethernet controllers
+  get_pci_by_class 02 00 1                     # Ethernet + parent bridges
+  get_pci_by_class 0c 03 1 usb                 # USB controllers + parents + USB children
+  get_pci_by_class usb '' 1 usb                # Same as above (convenience)
+  get_pci_by_class tbt '' 0 tbt                # Thunderbolt controllers + TB children
+  get_pci_by_class 0c 08 0 all                 # Thunderbolt controllers + both child types
+
+PCI Class Codes:
+  01 = Mass Storage Controller
+       00 = SCSI      08 = NVMe
+       01 = IDE       04 = RAID
+  02 = Network Controller
+       00 = Ethernet  80 = Other
+  03 = Display Controller
+       00 = VGA       80 = Other
+  04 = Multimedia
+       00 = Video     01 = Audio
+  06 = Bridge Device             # Often parents of other devices
+       00 = Host/PCI  04 = PCI-PCI
+  0c = Serial Bus
+       03 = USB       08 = Thunderbolt
+
+Output Format:
+  PCI\VEN_XXXX&DEV_YYYY[&SUBSYS_ZZZZVVVV][&REV_RR]
+  USB\VID_XXXX&PID_YYYY[&REV_RR][&SERIAL_SSSS]
+  TBT\UNIQUE_<id>[&VENDOR_<name>][&DEVICE_<name>]
+HELP
+        return 0
+    fi
+
+    # Convenience mapping: 'usb' and 'tbt/thunderbolt'
+    local main_hex="${main}"
+    if [[ "${main,,}" == "usb" ]]; then
+        main_hex="0c"
+        [[ -n "$sub_filter" ]] || sub_filter="03"
+    elif [[ "${main,,}" == "tbt" || "${main,,}" == "thunderbolt" ]]; then
+        main_hex="0c"
+        [[ -n "$sub_filter" ]] || sub_filter="08"
+    fi
+
+    if [[ ! "$main_hex" =~ ^[0-9a-fA-F]{2}$ ]]; then
+        echo "Invalid main class. Run without arguments for help." >&2
+        return 1
+    fi
+
+    # Normalize children selector
+    case "${children,,}" in
+        usb|tbt|all|0|"") ;;
+        *) echo "Invalid <children>. Use: usb|tbt|all|0" >&2; return 1 ;;
+    esac
+
+    shopt -s nullglob
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/class" ]] || continue
+
+        local CLASS_HEX MAIN SUB
+        CLASS_HEX="$(<"$dev/class")"
+        CLASS_HEX="${CLASS_HEX#0x}"
+        MAIN="${CLASS_HEX:0:2}"
+        SUB="${CLASS_HEX:2:2}"
+
+        [[ "${MAIN,,}" == "${main_hex,,}" ]] || continue
+        if [[ -n "$sub_filter" && "$sub_filter" != "*" ]]; then
+            [[ "${SUB,,}" == "${sub_filter,,}" ]] || continue
+        fi
+
+        # NEW: Include parent devices (bridges/hosts) if requested
+        if [[ "$include_parents" == "1" ]]; then
+            local parents=()
+            local current="$dev"
+
+            # Walk up the PCI hierarchy via symlinks
+            while [[ -L "$current" ]]; do
+                local target
+                target="$(readlink "$current")"
+                [[ "$target" =~ ^\.\. ]] || break
+                current="$(realpath -m "$current/$target" 2>/dev/null || echo "$current")"
+                [[ -d "$current" && -r "$current/class" ]] || break
+                parents+=("$current")
+            done
+
+            # Output parents FIRST (dependency order)
+            for parent in "${parents[@]}"; do
+                _print_pci_id "$parent"
+            done
+        fi
+
+        # Output target PCI device (controller)
+        _print_pci_id "$dev"
+
+        # NEW: Enumerate child devices attached to this controller
+        if [[ "${children,,}" == "usb" || "${children,,}" == "all" ]]; then
+            _list_usb_children "$dev"
+        fi
+        if [[ "${children,,}" == "tbt" || "${children,,}" == "all" ]]; then
+            _list_tbt_children "$dev"
+        fi
+    done
+    shopt -u nullglob
+}
+######################################################################
+
+######################################################################
+# Helper: print PCI ID from sysfs path
+######################################################################
+function _print_pci_id() {
+    local dev_path="$1"
+    [[ -r "$dev_path/vendor" ]] || return 1
+
+    local VEN DEV SVEN SDEV REV
+    VEN="$(sed 's/^0x//' "$dev_path/vendor")"
+    DEV="$(sed 's/^0x//' "$dev_path/device")"
+    SVEN="$(sed 's/^0x//' "$dev_path/subsystem_vendor" 2>/dev/null || true)"
+    SDEV="$(sed 's/^0x//' "$dev_path/subsystem_device" 2>/dev/null || true)"
+    REV="$(sed 's/^0x//' "$dev_path/revision" 2>/dev/null || true)"
+
+    printf 'PCI\\VEN_%s&DEV_%s' "${VEN^^}" "${DEV^^}"
+    if [[ -n "$SVEN" && -n "$SDEV" ]]; then
+        printf '&SUBSYS_%s%s' "${SDEV^^}" "${SVEN^^}"
+    fi
+    [[ -n "$REV" ]] && printf '&REV_%s' "${REV^^}"
+    printf '\n'
+}
+######################################################################
+
+######################################################################
+## NEW: USB child enumeration + formatter ############################
+######################################################################
+function _list_usb_children() {
+    local pci_dev="$1"
+
+    # USB host buses are typically under the PCI device directory as 'usbX'
+    local bus
+    for bus in "$pci_dev"/usb*; do
+        [[ -d "$bus" ]] || continue
+        # Enumerate all USB device directories under the bus
+        local udev
+        for udev in "$bus"/*; do
+            [[ -d "$udev" ]] || continue
+            # Some entries are interfaces (e.g., 1-1:1.0); we only want device nodes with idVendor/idProduct
+            if [[ -r "$udev/idVendor" && -r "$udev/idProduct" ]]; then
+                _print_usb_id "$udev"
+            fi
+            # Also search deeper (e.g., hubs with downstream devices)
+            local sub
+            for sub in "$udev"/*; do
+                [[ -d "$sub" ]] || continue
+                if [[ -r "$sub/idVendor" && -r "$sub/idProduct" ]]; then
+                    _print_usb_id "$sub"
+                fi
+            done
+        done
+    done
+}
+######################################################################
+
+######################################################################
+function _print_usb_id() {
+######################################################################
+    local udev="$1"
+    local VID PID BCD SERIAL
+    VID="$(sed 's/^0x//' "$udev/idVendor" 2>/dev/null || true)"
+    PID="$(sed 's/^0x//' "$udev/idProduct" 2>/dev/null || true)"
+    BCD="$(sed 's/^0x//' "$udev/bcdDevice" 2>/dev/null || true)"
+    SERIAL="$(<"$udev/serial" 2>/dev/null || true)"
+
+    [[ -n "$VID" && -n "$PID" ]] || return 0
+
+    printf 'USB\\VID_%s&PID_%s' "${VID^^}" "${PID^^}"
+    [[ -n "$BCD" ]]    && printf '&REV_%s' "${BCD^^}"
+    [[ -n "$SERIAL" ]] && printf '&SERIAL_%s' "$(echo "$SERIAL" | tr '[:space:]' '_' )"
+    printf '\n'
+}
+######################################################################
+
+######################################################################
+## NEW: Thunderbolt (USB4) child enumeration + formatter #############
+######################################################################
+function _list_tbt_children() {
+    local pci_dev="$1"
+
+    # Thunderbolt domains/devices often appear under the PCI device as 'domain*' or 'thunderbolt/*'
+    local tbroot
+    for tbroot in "$pci_dev"/thunderbolt "$pci_dev"/domain*; do
+        [[ -d "$tbroot" ]] || continue
+        local tbdev
+        for tbdev in "$tbroot"/*; do
+            [[ -d "$tbdev" ]] || continue
+            # Device directories typically have these attributes:
+            # - unique_id
+            # - vendor_name / device_name
+            # - authorized
+            # Some systems also expose numeric vendor/device
+            if [[ -r "$tbdev/unique_id" || -r "$tbdev/vendor_name" || -r "$tbdev/device_name" ]]; then
+                _print_thunderbolt_id "$tbdev"
+            fi
+        done
+    done
+
+    # Fallback: global thunderbolt bus, filtered by parent link if available
+    # (Useful on systems where TB devices are not nested directly under the PCI controller node)
+    if [[ -d /sys/bus/thunderbolt/devices ]]; then
+        local tbdev
+        for tbdev in /sys/bus/thunderbolt/devices/*; do
+            [[ -d "$tbdev" ]] || continue
+            # Attempt to check ancestry: many TB device entries have a 'device' symlink pointing
+            # somewhere under /sys/devices/...; we match if it contains the PCI dev path.
+            if [[ -L "$tbdev/device" ]]; then
+                local target
+                target="$(realpath -m "$tbdev/device" 2>/dev/null || true)"
+                if [[ -n "$target" && "$target" == "$pci_dev"* ]]; then
+                    _print_thunderbolt_id "$tbdev"
+                fi
+            fi
+        done
+    fi
+}
+######################################################################
+
+
+######################################################################
+function _print_thunderbolt_id() {
+######################################################################
+    local tbdev="$1"
+    local UID VNAME DNAME VNUM DNUM
+    UID="$(<"$tbdev/unique_id" 2>/dev/null || true)"
+    VNAME="$(<"$tbdev/vendor_name" 2>/dev/null || true)"
+    DNAME="$(<"$tbdev/device_name" 2>/dev/null || true)"
+    VNUM="$(sed 's/^0x//' "$tbdev/vendor" 2>/dev/null || true)"
+    DNUM="$(sed 's/^0x//' "$tbdev/device" 2>/dev/null || true)"
+
+    # Build a readable identifier; prefer unique_id if available
+    printf 'TBT\\UNIQUE_%s' "$(echo "${UID:-unknown}" | tr '[:space:]' '_' )"
+
+    if [[ -n "$VNAME" ]]; then
+        printf '&VENDOR_%s' "$(echo "$VNAME" | tr '[:space:]' '_' )"
+    elif [[ -n "$VNUM" ]]; then
+        printf '&VENDOR_%s' "${VNUM^^}"
+    fi
+
+    if [[ -n "$DNAME" ]]; then
+        printf '&DEVICE_%s' "$(echo "$DNAME" | tr '[:space:]' '_' )"
+    elif [[ -n "$DNUM" ]]; then
+        printf '&DEVICE_%s' "${DNUM^^}"
+    fi
+
+    printf '\n'
+}
+######################################################################
+
+
+######################################################################
+## FUNCTION updates_page1 ############################################
+######################################################################
+function updates_page1 () {
+ local query="$1"
+  if [ -z "$query" ]; then
+   echo "Usage: updates_page1 <QUERY>"
+   echo "       <QUERY> is what you would enter in the search field"
+   echo "       at https://www.catalog.update.microsoft.com/"
+   echo ""
+   echo "Result will be a list of Update-IDs (GUIDs) for the <QUERY>"
+   return 1
+  fi
+  # URL to Microsofts Driver Catalog
+  url='https://www.catalog.update.microsoft.com/Search.aspx'
+  local response
+  response=$(curl -s --data-urlencode "q=${query}" -X GET "$url")
+  #echo "$response" > "response.html" # can be uncommented for debugging
+  # use only n lines
+  local maxidlines
+  maxidlines=5
+  ids=$(echo "$response" | grep C0_R | grep -P 'id=".*C0_R' | sed 's@.*id="\(.*\)_C.*@\1@g' | head -n $maxidlines)
+  #ids=$(echo "$response" | grep C0_R | grep -P 'id=".*C0_R' | sed 's@.*id="\(.*\)_C.*@\1@g')
+  if [ -z "$ids" ]; then
+   #echo "No update-ids found"
+   return 1
+  else
+   echo "$ids"
+   return 0
+  fi
+}
+######################################################################
+
+######################################################################
+## FUNCTION get_update_details #######################################
+######################################################################
+# can be called via get_update_details "GUID"
+# eg.               get_update_details "75fe910b-bda3-483e-beaf-d6b924bb1ac4"
+# returns "$guid$|driverversiondate_sortable|$driverversiondate|$driverversion|$driverclass|$manufacturer|$drivermodel|$company|$hwids_brackets"
+# e.g.    95efe496-a43d-4850-97ca-dbe118861ec1|2025/9/13|9/13/2025|23.170.0.3|OtherHardware|Intel Corporation|Intel(R) Wireless Bluetooth(R)|(usb\vid_8087&pid_0026&rev_0000,usb\vid_8087&pid_0026&rev_0001,usb\vid_8087&pid_0026&rev_0002)
+function get_update_details() {
+    local guid="$1"
+    if [ -z "$guid" ]; then
+        echo "Usage: get_update_details <GUID>"
+        return 1
+    fi
+    local response
+    response=$(curl -s -X GET "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=${guid}#PackageDetails")
+        #echo "$response" > "response.html"
+        company=$(echo "$response" | grep -P 'id="ScopedViewHandler_company"' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        if [ -z "$company" ]; then company='-empty-';fi
+        manufacturer=$(echo "$response" | grep -P 'ScopedViewHandler_manufacturer' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        if [ -z "$manufacturer" ]; then manufacturer='-empty-';fi
+        driverclass=$(echo "$response" | grep -P 'ScopedViewHandler_driverClass' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        if [ -z "$driverclass" ]; then driverclass='-empty-';fi
+        drivermodel=$(echo "$response" | grep -P 'ScopedViewHandler_driverModel' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        if [ -z "$drivermodel" ]; then drivermodel='-empty-';fi
+        driverversion=$(echo "$response" | grep -P 'ScopedViewHandler_version"' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        if [ -z "$driverversion" ]; then driverversion='-empty-';fi
+        driverversiondate=$(echo "$response" | grep -P 'ScopedViewHandler_versionDate"' | sed 's@<span id=".*">\(.*\)</span>.*$@\1@g' | sed 's@\s*\(.*\)@\1@g')
+        driverversiondate_sortable=$(echo "$driverversiondate" | awk -F '/' '{print $3"/"$1"/"$2}')
+        if [ -z "$driverversiondate" ]; then driverversiondate='-empty-';fi
+        # supported hardware ids
+        #hwids=$(echo "$response" | grep -oP '(usb\\|pci\\|acpi\\|hid\\|net\\|scsi\\|display\\|hdaudio\\|bluetooth\\|serenum\\|i2c\\|ac97\\|isapnp\\|root\\).*\w')
+        hwids_nobreaks=$(echo "$response" | grep -oP '(usb\\|pci\\|acpi\\|hid\\|net\\|scsi\\|display\\|hdaudio\\|bluetooth\\|serenum\\|i2c\\|ac97\\|isapnp\\|root\\).*\w' | tr '\n' ','| sed 's@,$@@g')
+        hwids_brackets="($hwids_nobreaks)"
+        # give back a result sorted by column 2 and then by column 4
+        # How it works
+        # -k2,2r: Field 2 descending (latest date first)
+        #        2018/12/31 → 2017/1/1 → 2016/4/5
+        # -k4,4nr: Field 4 descending numeric (highest version first)
+        #        12.15.22.6 → 10.0.0.1 → 3.5.0.0
+        echo "$guid|$driverversiondate_sortable|$driverversiondate|$driverversion|$driverclass|$manufacturer|$drivermodel|$company|$hwids_brackets" | sort -t '|' -k2,2r -k4,4nr
+}
+######################################################################
+
+
+######################################################################
+## FUNCTION get_update_link #########################################
+######################################################################
+# can be called via get_update_link "GUID"
+# eg.               get_update_link "75fe910b-bda3-483e-beaf-d6b924bb1ac4"
+function get_update_link() {
+    local guid="$1"
+    if [ -z "$guid" ]; then
+        echo "Usage: get_update_link <GUID>"
+        return 1
+    fi
+
+    # Create the JSON payload (compressed into one line)
+    local post="{\"size\":0,\"UpdateID\":\"$guid\",\"UpdateIDInfo\":\"$guid\"}"
+    local body="UpdateIDs=[$post]"
+
+    # Use curl to POST the data to the Microsoft update catalog URL
+    local response
+    response=$(curl -s -X POST "https://www.catalog.update.microsoft.com/DownloadDialog.aspx" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "$body")
+
+    # Replace www.download.windowsupdate with download.windowsupdate in response content
+    response=${response//www.download.windowsupdate/download.windowsupdate}
+
+    # Extract URLs matching downloadInformation[0].files[n].url = '...kb...'
+    local links=()
+    while IFS= read -r line; do
+        links+=("$line")
+    done < <(echo "$response" | grep -oP "downloadInformation\[0\]\.files\[\d+\]\.url\s*=\s*'\K([^']*kb\d+[^']*)")
+
+    # If no matches found, try fallback regex for the first file only
+    if [ ${#links[@]} -eq 0 ]; then
+        while IFS= read -r line; do
+            links+=("$line")
+        done < <(echo "$response" | grep -oP "downloadInformation\[0\]\.files\[0\]\.url\s*=\s*'\K([^']*)")
+    fi
+
+    # If still no matches, return nothing
+    if [ ${#links[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    # Parse KB numbers and sort links by KB descending (requires GNU sort)
+    for link in "${links[@]}"; do
+        # Extract KB number from link using grep
+        if [[ "$link" =~ kb([0-9]+) ]]; then
+            kbnum=${BASH_REMATCH[1]}
+        else
+            kbnum=0
+        fi
+        echo -e "$kbnum\t$link"
+    done | sort -r -n -k1,1 | cut -f2
+}
+######################################################################
+
+
+######################################################################
+# Helper: run updates_page1 and treat non-empty stdout as success.
+######################################################################
+updates_try() {
+  local id="$1"
+  local out
+  out=$(updates_page1 "$id")
+  if [[ -n $out ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  return 1
+}
+######################################################################
+
+########## THE END ###################################################
